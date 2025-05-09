@@ -1,5 +1,5 @@
 site_name: "RRA Population Covariates"
-repo_url: https://github.com/MFStark/rra-population-covariates
+repo_url: https://github.com/ihmeuw/rra-population-covariates
 
 theme:
   name: material

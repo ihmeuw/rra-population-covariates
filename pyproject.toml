@@ -13,9 +13,9 @@ dependencies = [
 ]
 
 [project.urls]
-homepage = "https://MFStark.github.io/rra-population-covariates"
-repository = "https://github.com/MFStark/rra-population-covariates"
-documentation = "https://MFStark.github.io/rra-population-covariates"
+homepage = "https://ihmeuw.github.io/rra-population-covariates"
+repository = "https://github.com/ihmeuw/rra-population-covariates"
+documentation = "https://ihmeuw.github.io/rra-population-covariates"
 
 [project.scripts]
 my-cli = "rra_population_covariates.cli:main"
