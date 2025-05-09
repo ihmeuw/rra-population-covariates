@@ -10,6 +10,13 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "click",
+    "pandas (>=2.2.3,<3.0.0)",
+    "geopandas (>=1.0.1,<2.0.0)",
+    "shapely (>=2.1.0,<3.0.0)",
+    "rra-tools (>=1.0.25,<2.0.0)",
+    "matplotlib (>=3.10.3,<4.0.0)",
+    "tqdm (>=4.67.1,<5.0.0)",
+    "pyarrow (>=20.0.0,<21.0.0)",
 ]
 
 [project.urls]
@@ -18,7 +25,8 @@ repository = "https://github.com/ihmeuw/rra-population-covariates"
 documentation = "https://ihmeuw.github.io/rra-population-covariates"
 
 [project.scripts]
-my-cli = "rra_population_covariates.cli:main"
+pcrun = "rra_population_covariates.cli:pcrun"
+pctask = "rra_population_covariates.cli:pctask"
 
 [tool.poetry]
 packages = [
@@ -31,14 +39,14 @@ python = ">=3.12, <4.0"
 
 # We keep the dev dependencies here instead of in the project optional dependencies
 # so they're still installed by default with `poetry install`.
-# They won't be installed or shipped with the package. 
+# They won't be installed or shipped with the package.
 [tool.poetry.group.dev.dependencies]
 # Things we want to put a lower bound on
 mypy = "^1.15.0"
 mkdocs-material = "^9.6.0"
 pre-commit = "^4.0.0"
 pytest = "^8.3.0"
-ruff = "^0.9.7" 
+ruff = "^0.9.7"
 # Things we don't care about the version
 mkdocstrings = {extras = ["python"], version = "*"}
 mkdocs-table-reader-plugin = "*"
