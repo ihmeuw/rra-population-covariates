@@ -1,0 +1,19 @@
+{
+  "template": "https://github.com/collijk/python-package-cookiecutter",
+  "commit": "d86abba2604d3fb06b718d45a83170b6315debde",
+  "checkout": null,
+  "context": {
+    "cookiecutter": {
+      "author_name": "Marcon",
+      "author_email": "mfiking@uw.edu",
+      "github_username": "MFStark",
+      "project_name": "RRA Population Covariates",
+      "project_slug": "rra-population-covariates",
+      "package_name": "rra_population_covariates",
+      "project_short_description": "Proccessing pipeline for population model covariates",
+      "_template": "https://github.com/collijk/python-package-cookiecutter",
+      "_commit": "d86abba2604d3fb06b718d45a83170b6315debde"
+    }
+  },
+  "directory": null
+}
