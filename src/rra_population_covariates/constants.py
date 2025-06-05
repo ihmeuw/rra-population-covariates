@@ -20,6 +20,16 @@ DRIVABLE_CLASS_MAP = {
     "unknown": "unknown",  # Class not identified; could be drivable, but should be verified
 }
 
+WATER_CLASS_MAP = {
+    "stream_water": "stream",
+    "river_water": "river",
+    "inland_water": "lake,pond,oxbow,spring",
+    "manmade_freshwater": "canal,basin,fishpond,reservoir",
+    "waste_and_sewage": "wastewater,sewage,ditch,drain",
+    "coastal_marine": "ocean,sea,bay,strait,lagoon,tidal_channel",
+}
+
 OVERTURE_CLASS_MAPS = {
     "roads": DRIVABLE_CLASS_MAP,
+    "water": WATER_CLASS_MAP,
 }
