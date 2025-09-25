@@ -26,7 +26,8 @@ WATER_CLASS_MAP = {
     "inland_water": "lake,pond,oxbow,spring",
     "manmade_freshwater": "canal,basin,fishpond,reservoir",
     "waste_and_sewage": "wastewater,sewage,ditch,drain",
-    "coastal_marine": "ocean,sea,bay,strait,lagoon,tidal_channel",
+    "coastal_ocean": "ocean,sea",
+    "coastal_inlet": "bay,strait,lagoon,tidal_channel",
 }
 
 OVERTURE_CLASS_MAPS = {
