@@ -36,6 +36,24 @@ def list_remote_quadkeys(quadkey_prefixes: tuple[str, ...]) -> list[str]:
     )
 
 
+def download_reference_files(
+    rcov_data: RawCovariateData,
+    *,
+    overwrite: bool = False,
+) -> None:
+    """Download the reference tables published alongside the building data."""
+    for filename in pcc.OBM_REFERENCE_FILES:
+        path = rcov_data.open_building_map_reference_path(filename)
+        if path.exists() and not overwrite:
+            continue
+        response = requests.get(
+            pcc.OBM_ADDITIONAL_FILES_URL + filename, timeout=TIMEOUT
+        )
+        response.raise_for_status()
+        path.write_bytes(response.content)
+        click.echo(f"reference: {filename} ({len(response.content)} bytes)")
+
+
 def download_tile(url: str, path: Path) -> tuple[int, int]:
     """Download a bz2-compressed tile, decompressing it as it streams.
 
@@ -139,6 +157,8 @@ def open_building_map(
 ) -> None:
     """Run the Open Building Map download pipeline."""
     rcov_data = RawCovariateData(output_dir)
+    rcov_data.create_open_building_map_root()
+    download_reference_files(rcov_data, overwrite=overwrite)
 
     # Tile sizes span four orders of magnitude and cluster geographically, so we
     # fan out one task per tile and let the scheduler balance the load rather

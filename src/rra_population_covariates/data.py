@@ -37,9 +37,34 @@ class RawCovariateData:
 
     def create_open_building_map_root(self) -> None:
         mkdir(self.open_building_map, exist_ok=True, parents=True)
+        mkdir(self.open_building_map_reference, exist_ok=True)
 
     def open_building_map_path(self, quadkey: str) -> Path:
         return self.open_building_map / f"building.{quadkey}.gpkg"
+
+    @property
+    def open_building_map_reference(self) -> Path:
+        return self.open_building_map / "reference"
+
+    def open_building_map_reference_path(self, filename: str) -> Path:
+        return self.open_building_map_reference / filename
+
+    def load_obm_overriding_occupancies(self) -> set[str]:
+        """Get the occupancy codes assigned from an explicit source tag.
+
+        These are the higher-confidence labels; the rest are inferred.
+        """
+        path = self.open_building_map_reference_path(
+            pcc.OBM_OVERRIDING_OCCUPANCIES_FILE
+        )
+        if not path.exists():
+            msg = (
+                f"{path} not found. Run 'pcrun extract open_building_map' to "
+                "download the Open Building Map reference files."
+            )
+            raise FileNotFoundError(msg)
+        lines = path.read_text().splitlines()
+        return {line.split(",")[0].strip() for line in lines if line.strip()}
 
     def list_open_building_map_paths(self) -> list[Path]:
         return sorted(self.open_building_map.glob("building.*.gpkg"))
