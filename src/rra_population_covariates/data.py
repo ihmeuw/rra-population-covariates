@@ -1,10 +1,13 @@
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import geopandas as gpd  # type: ignore[import-untyped]
 from rra_tools.shell_tools import mkdir, touch
 
 from rra_population_covariates import constants as pcc
+
+if TYPE_CHECKING:
+    import rasterra as rt
 
 
 class RawCovariateData:
@@ -92,6 +95,36 @@ class CovariateData:
         return self.logs / step_name
 
     @property
+    def open_building_map(self) -> Path:
+        return self._root / "open_building_map" / pcc.OBM_VERSION
+
+    def open_building_map_raster_path(
+        self,
+        resolution: str,
+        block_key: str,
+        parent_building_type: str,
+    ) -> Path:
+        return (
+            self.open_building_map
+            / f"{resolution}m"
+            / block_key
+            / f"{parent_building_type}.tif"
+        )
+
+    def save_open_building_map_raster(
+        self,
+        raster: "rt.RasterArray",
+        resolution: str,
+        block_key: str,
+        parent_building_type: str,
+    ) -> None:
+        path = self.open_building_map_raster_path(
+            resolution, block_key, parent_building_type
+        )
+        mkdir(path.parent, exist_ok=True, parents=True)
+        save_raster(raster, path)
+
+    @property
     def overture(self) -> Path:
         return self._root / "overture"
 
@@ -104,6 +137,27 @@ class CovariateData:
         path = self.overture_path(covariate, class_key)
         mkdir(path.parent, exist_ok=True)
         save_geo_parquet(gdf, path)
+
+
+def save_raster(
+    raster: "rt.RasterArray",
+    output_path: str | Path,
+    num_cores: int = 1,
+    **kwargs: Any,
+) -> None:
+    """Save a raster with the same parameters the population model features use."""
+    save_params = {
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+        "compress": "ZSTD",
+        "predictor": 2,  # horizontal differencing
+        "num_threads": num_cores,
+        "bigtiff": "yes",
+        **kwargs,
+    }
+    touch(output_path, clobber=True)
+    raster.to_file(output_path, **save_params)
 
 
 def save_geo_parquet(
