@@ -103,12 +103,16 @@ class CovariateData:
         resolution: str,
         block_key: str,
         parent_building_type: str,
+        measure: str,
     ) -> Path:
+        if measure not in pcc.OBM_MEASURES:
+            msg = f"Unknown measure {measure!r}; expected one of {pcc.OBM_MEASURES}."
+            raise ValueError(msg)
         return (
             self.open_building_map
             / f"{resolution}m"
             / block_key
-            / f"{parent_building_type}.tif"
+            / f"{parent_building_type}_{measure}.tif"
         )
 
     def save_open_building_map_raster(
@@ -117,9 +121,10 @@ class CovariateData:
         resolution: str,
         block_key: str,
         parent_building_type: str,
+        measure: str,
     ) -> None:
         path = self.open_building_map_raster_path(
-            resolution, block_key, parent_building_type
+            resolution, block_key, parent_building_type, measure
         )
         mkdir(path.parent, exist_ok=True, parents=True)
         save_raster(raster, path)

@@ -139,6 +139,40 @@ def coverage_fraction(
     return cast("np.ndarray[Any, Any]", averaged)
 
 
+def building_height(
+    bd_data: Any,
+    resolution: str,
+    block_key: str,
+    covered: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Get GHSL building height for a block, with one-storey imputation.
+
+    `covered` marks the pixels that hold OBM footprints. A single storey is substituted
+    only there, since that is the only place the height is ever used - everywhere else
+    it multiplies a zero coverage. Restricting the substitution keeps the returned array
+    honest: 2.5 m appears only where it actually contributes to a written value, rather
+    than across the ~78% of land that GHSL considers unbuilt.
+
+    Returns the height in meters and the mask of substituted pixels, which the caller
+    reports. See OBM_ONE_STOREY_HEIGHT_M in constants.py for why GHSL height is used at
+    all and why 2.5 m is the fallback.
+    """
+    height = bd_data.load_tile(
+        resolution=resolution,
+        provider=pcc.OBM_HEIGHT_PROVIDER,
+        measure=pcc.OBM_HEIGHT_MEASURE,
+        time_point=pcc.OBM_HEIGHT_TIME_POINT,
+        block_key=block_key,
+    ).to_numpy()
+    # GHSL reports 0, not nan, on unbuilt land, and its nodata mask does not always match
+    # the template's land mask. Fill first so that no nan can survive into the volume
+    # rasters, whose mask must match the density rasters exactly.
+    height = np.nan_to_num(height)
+    imputed = covered & (height == 0)
+    height = np.where(imputed, pcc.OBM_ONE_STOREY_HEIGHT_M, height).astype(np.float32)
+    return cast("np.ndarray[Any, Any]", height), cast("np.ndarray[Any, Any]", imputed)
+
+
 def open_building_map_main(
     resolution: str,
     block_key: str,
@@ -232,14 +266,38 @@ def open_building_map_main(
 
     # Land mask: nan outside the modeled area, matching every other feature.
     land = ~np.isnan(block_template.to_numpy())
-    for parent, array in coverage.items():
+
+    # Volume is height * density with height constant per pixel, so it factors out of
+    # the accumulation entirely and is a multiply over the finished density arrays. No
+    # second pass over the footprints is needed.
+    covered = land & (sum(coverage.values()) > 0)
+    height, imputed = building_height(bd_data, resolution, block_key, covered)
+    n_covered = int(covered.sum())
+    n_imputed = int(imputed.sum())
+    share = 100 * n_imputed / n_covered if n_covered else 0.0
+    click.echo(
+        f"{block_key}: {n_covered:,} pixels hold OBM footprints; GHSL had no height for "
+        f"{n_imputed:,} of them ({share:.2f}%), imputed at "
+        f"{pcc.OBM_ONE_STOREY_HEIGHT_M} m."
+    )
+
+    def save(array: np.ndarray, parent: str, measure: str) -> None:
         raster = rt.RasterArray(
             np.where(land, array, np.nan).astype(np.float32),
             transform=block_transform,
             crs=block_template.crs,
             no_data_value=np.nan,
         )
-        cov_data.save_open_building_map_raster(raster, resolution, block_key, parent)
+        cov_data.save_open_building_map_raster(
+            raster, resolution, block_key, parent, measure
+        )
+
+    # Write and release one parent at a time; holding both measures for all eight
+    # parents at once would double peak memory for no benefit.
+    for parent in list(coverage):
+        density = coverage.pop(parent)
+        save(density, parent, "density")
+        save(height * density, parent, "volume")
 
 
 @click.command()

@@ -246,3 +246,34 @@ OBM_TEMPLATE_TIME_POINT = "2023q4"
 # this many times finer than the target and average down, giving the fraction of each
 # pixel covered by footprints. Area is preserved exactly and precision is 1/100.
 OBM_SUPERSAMPLE_FACTOR = 10
+
+# Two measures are written per parent building type:
+#   density  the fraction of the pixel covered by footprints of that type (0-1). This is
+#            the direct analogue of GHSL's built-up fraction (BUFRAC).
+#   volume   height * density, in meters of built volume per m2 of ground. Same units and
+#            convention as GHSL's built-up volume, which is ANBH * BUSURF.
+OBM_MEASURES = ["density", "volume"]
+
+# Height for the volume measure comes from GHSL rather than from OBM's own height
+# column. OBM's heights are themselves derived from GHSL R2023A (Oostwegel et al. 2025,
+# section 3), and OBM records them as GEM taxonomy storey *ranges* - about 88% of
+# buildings carry a range such as "HBET:1-5" rather than a value. Reading GHSL directly
+# follows OBM's own convention while avoiding a guessed range midpoint and a guessed
+# meters-per-storey factor. The consequence is that our volume is not independent of
+# GHSL in the height dimension; density remains fully independent.
+OBM_HEIGHT_PROVIDER = "ghsl_r2023a"
+OBM_HEIGHT_MEASURE = "height"
+OBM_HEIGHT_TIME_POINT = "2025q1"
+
+# Where GHSL reports no height we substitute a single storey. GHSL has no concept of a
+# storey - its height (ANBH) is a continuous value in meters - but it has a hard
+# empirical floor: the smallest non-zero ANBH measured is 2.4861 m in the Sao Paulo
+# block and 2.4864 m in Tokyo, with the low-rise mass sitting just above 2.50 m. The
+# population model uses HEIGHT_MIN = 2.4384 m (8 ft) for the same crosswalk. Those
+# agree to within 5 cm, so 2.5 m is the defensible one-storey height.
+#
+# This only ever applies where GHSL sees no building at all: measured across two blocks,
+# no pixel has GHSL density > 0 with height == 0, so GHSL never omits a height where it
+# reports surface. The affected pixels are those where OBM has footprints and GHSL has
+# nothing, and the per-block count is logged so the total is reportable.
+OBM_ONE_STOREY_HEIGHT_M = 2.5
