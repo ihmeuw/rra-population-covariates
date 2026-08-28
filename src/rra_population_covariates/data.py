@@ -1,10 +1,13 @@
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import geopandas as gpd  # type: ignore[import-untyped]
 from rra_tools.shell_tools import mkdir, touch
 
 from rra_population_covariates import constants as pcc
+
+if TYPE_CHECKING:
+    import rasterra as rt
 
 
 class RawCovariateData:
@@ -37,9 +40,34 @@ class RawCovariateData:
 
     def create_open_building_map_root(self) -> None:
         mkdir(self.open_building_map, exist_ok=True, parents=True)
+        mkdir(self.open_building_map_reference, exist_ok=True)
 
     def open_building_map_path(self, quadkey: str) -> Path:
         return self.open_building_map / f"building.{quadkey}.gpkg"
+
+    @property
+    def open_building_map_reference(self) -> Path:
+        return self.open_building_map / "reference"
+
+    def open_building_map_reference_path(self, filename: str) -> Path:
+        return self.open_building_map_reference / filename
+
+    def load_obm_overriding_occupancies(self) -> set[str]:
+        """Get the occupancy codes assigned from an explicit source tag.
+
+        These are the higher-confidence labels; the rest are inferred.
+        """
+        path = self.open_building_map_reference_path(
+            pcc.OBM_OVERRIDING_OCCUPANCIES_FILE
+        )
+        if not path.exists():
+            msg = (
+                f"{path} not found. Run 'pcrun extract open_building_map' to "
+                "download the Open Building Map reference files."
+            )
+            raise FileNotFoundError(msg)
+        lines = path.read_text().splitlines()
+        return {line.split(",")[0].strip() for line in lines if line.strip()}
 
     def list_open_building_map_paths(self) -> list[Path]:
         return sorted(self.open_building_map.glob("building.*.gpkg"))
@@ -67,6 +95,41 @@ class CovariateData:
         return self.logs / step_name
 
     @property
+    def open_building_map(self) -> Path:
+        return self._root / "open_building_map" / pcc.OBM_VERSION
+
+    def open_building_map_raster_path(
+        self,
+        resolution: str,
+        block_key: str,
+        parent_building_type: str,
+        measure: str,
+    ) -> Path:
+        if measure not in pcc.OBM_MEASURES:
+            msg = f"Unknown measure {measure!r}; expected one of {pcc.OBM_MEASURES}."
+            raise ValueError(msg)
+        return (
+            self.open_building_map
+            / f"{resolution}m"
+            / block_key
+            / f"{parent_building_type}_{measure}.tif"
+        )
+
+    def save_open_building_map_raster(
+        self,
+        raster: "rt.RasterArray",
+        resolution: str,
+        block_key: str,
+        parent_building_type: str,
+        measure: str,
+    ) -> None:
+        path = self.open_building_map_raster_path(
+            resolution, block_key, parent_building_type, measure
+        )
+        mkdir(path.parent, exist_ok=True, parents=True)
+        save_raster(raster, path)
+
+    @property
     def overture(self) -> Path:
         return self._root / "overture"
 
@@ -79,6 +142,27 @@ class CovariateData:
         path = self.overture_path(covariate, class_key)
         mkdir(path.parent, exist_ok=True)
         save_geo_parquet(gdf, path)
+
+
+def save_raster(
+    raster: "rt.RasterArray",
+    output_path: str | Path,
+    num_cores: int = 1,
+    **kwargs: Any,
+) -> None:
+    """Save a raster with the same parameters the population model features use."""
+    save_params = {
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+        "compress": "ZSTD",
+        "predictor": 2,  # horizontal differencing
+        "num_threads": num_cores,
+        "bigtiff": "yes",
+        **kwargs,
+    }
+    touch(output_path, clobber=True)
+    raster.to_file(output_path, **save_params)
 
 
 def save_geo_parquet(

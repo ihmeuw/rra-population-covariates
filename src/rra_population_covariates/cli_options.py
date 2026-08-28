@@ -17,6 +17,8 @@ from rra_tools.cli_tools import (
     with_verbose,
 )
 
+from rra_population_covariates import constants as pcc
+
 
 def with_overture_class_key[**P, T](
     choices: Collection[str] | None = None,
@@ -28,6 +30,27 @@ def with_overture_class_key[**P, T](
         allow_all=allow_all,
         choices=choices,
         help="Name of the Overture class key to process.",
+    )
+
+
+def with_obm_resolution[**P, T](
+    *,
+    allow_all: bool = False,
+) -> Callable[[Callable[P, T]], Callable[P, T]]:
+    return with_choice(
+        "obm_resolution",
+        allow_all=allow_all,
+        choices=pcc.OBM_RESOLUTIONS,
+        help="Modeling frame resolution in meters.",
+    )
+
+
+def with_obm_block_key[**P, T]() -> Callable[[Callable[P, T]], Callable[P, T]]:
+    return click.option(
+        "--obm-block-key",
+        type=click.STRING,
+        required=True,
+        help="Modeling frame block key to rasterize.",
     )
 
 
