@@ -1,6 +1,6 @@
 import click
 
-from rra_population_covariates import process
+from rra_population_covariates import extract, process
 
 
 @click.group()
@@ -13,7 +13,7 @@ def pctask() -> None:
     """Run an individual task in the population covariates pipeline."""
 
 
-for module in [process]:
+for module in [extract, process]:
     runners = getattr(module, "RUNNERS", {})
     task_runners = getattr(module, "TASK_RUNNERS", {})
 

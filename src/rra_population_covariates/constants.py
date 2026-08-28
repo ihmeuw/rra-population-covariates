@@ -34,3 +34,14 @@ OVERTURE_CLASS_MAPS = {
     "roads": DRIVABLE_CLASS_MAP,
     "water": WATER_CLASS_MAP,
 }
+
+# Open Building Map (Oostwegel et al. 2025), DOI 10.5880/GFZ.LKUT.2025.002.
+OBM_ROOT_URL = (
+    "https://datapub.gfz.de/download/10.5880.GFZ.LKUT.2025.002-Caweb/"
+    "2025-002_Oostwegel-et-al_data/"
+)
+# The upstream release date; used to version the raw data directory.
+OBM_VERSION = "2025-04-04"
+# Building packages are published one per zoom-6 quadkey (1271 tiles). We fan the
+# download out over zoom-2 quadkey prefixes, giving 16 groups of ~80 tiles each.
+OBM_QUADKEY_PREFIXES = [f"{first}{second}" for first in "0123" for second in "0123"]

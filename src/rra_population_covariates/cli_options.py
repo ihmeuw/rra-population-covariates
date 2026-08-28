@@ -1,5 +1,6 @@
 from collections.abc import Callable, Collection
 
+import click
 from rra_tools.cli_tools import (
     RUN_ALL,
     convert_choice,
@@ -27,6 +28,28 @@ def with_overture_class_key[**P, T](
         allow_all=allow_all,
         choices=choices,
         help="Name of the Overture class key to process.",
+    )
+
+
+def with_obm_quadkey[**P, T]() -> Callable[[Callable[P, T]], Callable[P, T]]:
+    return click.option(
+        "--obm-quadkey",
+        type=click.STRING,
+        required=True,
+        help="Zoom-6 quadkey of the Open Building Map tile to download.",
+    )
+
+
+def with_obm_quadkey_prefix[**P, T](
+    choices: Collection[str] | None = None,
+    *,
+    allow_all: bool = False,
+) -> Callable[[Callable[P, T]], Callable[P, T]]:
+    return with_choice(
+        "obm_quadkey_prefix",
+        allow_all=allow_all,
+        choices=choices,
+        help="Zoom-2 quadkey prefix of the Open Building Map tiles to process.",
     )
 
 

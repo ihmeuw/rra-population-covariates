@@ -23,6 +23,27 @@ class RawCovariateData:
         root = self.overture / f"theme={theme}" / f"type={theme_type}"
         return list(Path(root).glob("*.parquet"))
 
+    @property
+    def logs(self) -> Path:
+        return self._root / "logs"
+
+    def log_dir(self, step_name: str) -> Path:
+        mkdir(self.logs, exist_ok=True)
+        return self.logs / step_name
+
+    @property
+    def open_building_map(self) -> Path:
+        return self._root / "open_building_map" / pcc.OBM_VERSION
+
+    def create_open_building_map_root(self) -> None:
+        mkdir(self.open_building_map, exist_ok=True, parents=True)
+
+    def open_building_map_path(self, quadkey: str) -> Path:
+        return self.open_building_map / f"building.{quadkey}.gpkg"
+
+    def list_open_building_map_paths(self) -> list[Path]:
+        return sorted(self.open_building_map.glob("building.*.gpkg"))
+
 
 class CovariateData:
     def __init__(self, root: str | Path = pcc.COVARIATES_ROOT) -> None:
