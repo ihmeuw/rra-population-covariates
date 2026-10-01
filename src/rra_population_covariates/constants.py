@@ -277,3 +277,77 @@ OBM_HEIGHT_TIME_POINT = "2025q1"
 # reports surface. The affected pixels are those where OBM has footprints and GHSL has
 # nothing, and the per-block count is logged so the total is reportable.
 OBM_ONE_STOREY_HEIGHT_M = 2.5
+
+# Label source: whether a footprint's occupancy is the building's own or was inherited
+# from the OSM land-use zone it sits in. OBM does not record this, so we reconstruct
+# it from Overture, which repackages the same OSM data:
+#
+#   unknown    occupancy is UNK.
+#   inherited  labelled, no own OSM building class, and the centroid lies in a land-use
+#              zone that maps to the same parent as the label.
+#   tagged     every other labelled footprint: its own tag, a point of interest, or
+#              another OBM rule. The mixed-use codes are always tagged, since a single
+#              zone cannot supply two uses.
+OBM_LABEL_SOURCES = ["tagged", "inherited"]
+
+# Overture land-use classes mapped to parent building types. This reproduces the
+# `landuse` rows of OBM's B_building_and_POI_tags.csv, leaving out those OBM marks
+# UNDECIDABLE. Five of these classes (mine, leisure, farm, greenhouse, government)
+# are absent from Overture 2025-04-23.0: Overture drops those OSM landuse values
+# rather than renaming them, so footprints in such zones come out tagged. They are
+# kept here so the extract reports them as missing rather than hiding the gap.
+OBM_LAND_USE_PARENTS = {
+    **dict.fromkeys(["residential", "allotments", "garages"], "residential_mu"),
+    **dict.fromkeys(
+        ["industrial", "landfill", "mine", "quarry", "works"], "industrial"
+    ),
+    **dict.fromkeys(
+        ["commercial", "retail", "recreation_ground", "leisure"], "commercial"
+    ),
+    **dict.fromkeys(
+        [
+            "farm",
+            "farmland",
+            "farmyard",
+            "meadow",
+            "orchard",
+            "vineyard",
+            "plant_nursery",
+            "animal_keeping",
+            "greenhouse",
+            "greenhouse_horticulture",
+        ],
+        "agriculture",
+    ),
+    **dict.fromkeys(["military", "government"], "government"),
+    **dict.fromkeys(["education", "school"], "education"),
+    "religious": "assembly",
+}
+
+# Open Building Map's tiles are zoom-6 quadkeys. The Overture lookups are partitioned
+# on the same tiles so that each classification task reads only its own tile.
+OBM_QUADKEY_ZOOM = 6
+# Centroids are taken in an equal-area projection, then joined in EPSG:4326.
+OBM_EQUAL_AREA_CRS = "ESRI:54034"
+# The largest tile holds about 100M footprints (31 GB), so tiles are read in chunks.
+OBM_CLASSIFY_CHUNK_SIZE = 2_000_000
+
+# Rasterizing by label source splits every labelled parent into a tagged and an
+# inherited layer, so each block gets 15 layers (30 rasters) instead of 8. unknown is
+# not split. A model wanting the original parent layer adds the two halves.
+OBM_LABEL_SOURCE_LAYERS = [
+    *(
+        f"{parent}_{source}"
+        for parent in OBM_PARENT_BUILDING_TYPES
+        if parent != "unknown"
+        for source in OBM_LABEL_SOURCES
+    ),
+    "unknown",
+]
+
+# The original, unsplit rasters, moved aside so the split run can write to the usual
+# location. The split run checks itself against them block by block.
+OBM_REFERENCE_DIRNAME = "_open_building_map"
+# Pixels whose split sum differs from the reference by more than this count as
+# differing. The rasters are float32 fractions with 1/100 precision.
+OBM_CHECK_TOLERANCE = 1e-5

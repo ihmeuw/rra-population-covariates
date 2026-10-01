@@ -4,12 +4,15 @@ from typing import Any, cast
 import click
 import geopandas as gpd  # type: ignore[import-untyped]
 import numpy as np
+import pandas as pd  # type: ignore[import-untyped]
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import rasterra as rt
 import shapely  # type: ignore[import-untyped]
 import tqdm  # type: ignore[import-untyped]
 from affine import Affine  # type: ignore[import-untyped]
 from rasterio.features import rasterize  # type: ignore[import-untyped]
 from rra_tools import jobmon
+from rra_tools.shell_tools import mkdir, touch
 
 from rra_population_covariates import cli_options as clio
 from rra_population_covariates import constants as pcc
@@ -59,17 +62,69 @@ def list_local_quadkeys(rcov_data: RawCovariateData) -> dict[str, shapely.Polygo
     return {quadkey: shapely.box(*quadkey_bounds(quadkey)) for quadkey in quadkeys}
 
 
+def check_occupancy_codes(occupancy: "gpd.pd.Series") -> None:
+    """Fail if any occupancy code has no parent building type."""
+    unmapped = sorted(set(occupancy.unique()) - set(pcc.OBM_OCCUPANCY_WEIGHTS))
+    if unmapped:
+        msg = (
+            f"Occupancy codes with no parent building type: {unmapped}. Add them to "
+            "OBM_PARENT_BUILDING_TYPES or OBM_MIXED_USE_SPLITS in constants.py."
+        )
+        raise ValueError(msg)
+
+
+class LabelSourceLookup:
+    """The label source of every footprint, by tile and GeoPackage fid.
+
+    A block reads each of its tiles many times, once per modeling-frame tile, so each
+    tile's classification is loaded once and held as an array indexed by fid.
+    """
+
+    def __init__(self, cov_data: CovariateData) -> None:
+        self._cov_data = cov_data
+        self._tiles: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _load(self, quadkey: str) -> tuple[np.ndarray, np.ndarray]:
+        path = self._cov_data.open_building_map_classified_path(quadkey)
+        if not path.exists():
+            msg = (
+                f"{path} not found. Run 'pcrun extract open_building_map_label_source' "
+                "first."
+            )
+            raise FileNotFoundError(msg)
+        table = pq.read_table(path, columns=["fid", "label_source"])
+        fid = table.column("fid").to_numpy()
+        label_source = table.column("label_source").combine_chunks()
+        codes = np.full(fid.max() + 1, -1, dtype=np.int8)
+        codes[fid] = label_source.indices.to_numpy()
+        return codes, np.asarray(label_source.dictionary.to_pylist(), dtype=object)
+
+    def get(self, quadkey: str, fid: np.ndarray) -> np.ndarray:
+        if quadkey not in self._tiles:
+            self._tiles[quadkey] = self._load(quadkey)
+        codes, labels = self._tiles[quadkey]
+        if fid.max(initial=0) >= len(codes) or (codes[fid] < 0).any():
+            msg = (
+                f"Tile {quadkey} has footprints missing from its classification; "
+                "it is stale. Rerun the label source extract for this tile."
+            )
+            raise ValueError(msg)
+        return cast("np.ndarray[Any, Any]", labels[codes[fid]])
+
+
 def read_tile_buildings(
     rcov_data: RawCovariateData,
     quadkeys: list[str],
     bounds: tuple[float, float, float, float],
     target_crs: str,
+    label_sources: LabelSourceLookup | None = None,
 ) -> gpd.GeoDataFrame | None:
     """Read the buildings intersecting a bounding box, tagged by parent type.
 
     The bounding box is pushed into each GeoPackage's spatial index, so only the
     relevant footprints are materialized. Footprints straddling the edge are
-    returned whole and clipped later by the rasterization.
+    returned whole and clipped later by the rasterization. Given a lookup, each
+    footprint also gets its label source, joined on the GeoPackage fid.
     """
     frames = []
     for quadkey in quadkeys:
@@ -78,8 +133,13 @@ def read_tile_buildings(
             layer="building",
             columns=["occupancy"],
             bbox=bounds,
+            fid_as_index=True,
         )
         if not gdf.empty:
+            if label_sources is not None:
+                gdf["label_source"] = label_sources.get(
+                    quadkey, gdf.index.to_numpy(dtype=np.int64)
+                )
             frames.append(gdf)
 
     if not frames:
@@ -88,15 +148,7 @@ def read_tile_buildings(
     buildings = gpd.GeoDataFrame(
         gpd.pd.concat(frames, ignore_index=True), crs=frames[0].crs
     )
-    unmapped = sorted(
-        set(buildings["occupancy"].unique()) - set(pcc.OBM_OCCUPANCY_WEIGHTS)
-    )
-    if unmapped:
-        msg = (
-            f"Occupancy codes with no parent building type: {unmapped}. Add them to "
-            "OBM_PARENT_BUILDING_TYPES or OBM_MIXED_USE_SPLITS in constants.py."
-        )
-        raise ValueError(msg)
+    check_occupancy_codes(buildings["occupancy"])
     buildings["parent_building_type"] = buildings["occupancy"].map(
         pcc.OBM_OCCUPANCY_PARENTS
     )
@@ -173,12 +225,74 @@ def building_height(
     return cast("np.ndarray[Any, Any]", height), cast("np.ndarray[Any, Any]", imputed)
 
 
-def open_building_map_main(
+def parent_layers(parent: str, *, by_label_source: bool) -> list[str]:
+    """Get the layers a parent building type is written as."""
+    if not by_label_source or parent == "unknown":
+        return [parent]
+    return [f"{parent}_{source}" for source in pcc.OBM_LABEL_SOURCES]
+
+
+def compare_with_reference(  # noqa: PLR0913
+    cov_data: CovariateData,
+    resolution: str,
+    block_key: str,
+    parent: str,
+    layers: dict[str, np.ndarray],
+    land: np.ndarray,
+) -> dict[str, Any]:
+    """Compare a parent's split layers, summed, with the original unsplit raster.
+
+    The sum should match except where a tagged and an inherited footprint of the
+    same parent overlap: those were unioned in one layer before and are now in two,
+    so the split sum can be slightly higher there.
+    """
+    density = sum(layers.values())
+    row: dict[str, Any] = {
+        "block_key": block_key,
+        "parent": parent,
+        **{
+            f"density_{name.removeprefix(parent).strip('_') or 'all'}": float(
+                np.nansum(np.where(land, array, 0.0))
+            )
+            for name, array in layers.items()
+        },
+    }
+    path = cov_data.open_building_map_reference_raster_path(
+        resolution, block_key, parent, "density"
+    )
+    row["reference_found"] = path.exists()
+    if not path.exists():
+        return row
+
+    reference = np.nan_to_num(rt.load_raster(path).to_numpy())
+    new = np.where(land, density, 0.0)
+    reference = np.where(land, reference, 0.0)
+    diff = new - reference
+    built = (new > 0) | (reference > 0)
+    differs = built & (np.abs(diff) > pcc.OBM_CHECK_TOLERANCE)
+    reference_total = float(reference.sum())
+    row.update(
+        {
+            "max_abs_diff": float(np.abs(diff).max(initial=0.0)),
+            "n_built": int(built.sum()),
+            "n_differ": int(differs.sum()),
+            "reference_density": reference_total,
+            "density_diff": float(diff.sum()),
+            "density_diff_share": float(diff.sum() / reference_total)
+            if reference_total
+            else 0.0,
+        }
+    )
+    return row
+
+
+def open_building_map_main(  # noqa: C901, PLR0913, PLR0915
     resolution: str,
     block_key: str,
     raw_covariate_dir: str,
     output_dir: str,
     *,
+    by_label_source: bool = False,
     progress_bar: bool = False,
 ) -> None:
     from rra_population_model.data import (
@@ -210,11 +324,16 @@ def open_building_map_main(
 
     local_quadkeys = list_local_quadkeys(rcov_data)
 
-    # One accumulator per parent type, covering the whole block.
+    # One accumulator per layer, covering the whole block: a layer per parent type,
+    # or split by label source a tagged and an inherited layer per labelled parent.
+    label_sources = LabelSourceLookup(cov_data) if by_label_source else None
     coverage = {
-        parent: np.zeros(block_shape, dtype=np.float32)
+        layer: np.zeros(block_shape, dtype=np.float32)
         for parent in pcc.OBM_PARENT_BUILDING_TYPES
+        for layer in parent_layers(parent, by_label_source=by_label_source)
     }
+    # Mixed-use codes never come from a single zone, so they are always tagged.
+    mixed_suffix = "_tagged" if by_label_source else ""
 
     # Work tile by tile. A block spans hundreds of kilometers and could hold tens of
     # millions of footprints, which is more geometry than we want in memory at once.
@@ -230,7 +349,7 @@ def open_building_map_main(
             continue
 
         buildings = read_tile_buildings(
-            rcov_data, quadkeys, bounds, model_frame.crs.to_string()
+            rcov_data, quadkeys, bounds, model_frame.crs.to_string(), label_sources
         )
         if buildings is None:
             continue
@@ -247,22 +366,29 @@ def open_building_map_main(
         rows = slice(row_off, row_off + n_rows)
         cols = slice(col_off, col_off + n_cols)
 
-        # Codes that belong wholly to one parent are rasterized together per parent,
-        # so overlapping footprints of the same type are unioned rather than summed.
+        # Codes that belong wholly to one parent are rasterized together per layer,
+        # so overlapping footprints of the same layer are unioned rather than summed.
         # The mixed-use codes contribute a fraction to each of two parents, so each is
         # rasterized on its own and scaled by its weight.
         is_mixed = buildings["occupancy"].isin(pcc.OBM_MIXED_USE_SPLITS)
         whole, mixed = buildings[~is_mixed], buildings[is_mixed]
 
-        for parent, group in whole.groupby("parent_building_type"):
-            coverage[parent][rows, cols] += coverage_fraction(
+        whole_layer = whole["parent_building_type"]
+        if by_label_source:
+            # unknown is a parent and a label source at once, and is not split.
+            whole_layer = whole_layer.where(
+                whole["label_source"] == "unknown",
+                whole_layer + "_" + whole["label_source"],
+            )
+        for layer, group in whole.groupby(whole_layer):
+            coverage[layer][rows, cols] += coverage_fraction(
                 group.geometry, tile_shape, tile_transform
             )
 
         for code, group in mixed.groupby("occupancy"):
             fraction = coverage_fraction(group.geometry, tile_shape, tile_transform)
             for parent, weight in pcc.OBM_MIXED_USE_SPLITS[code].items():
-                coverage[parent][rows, cols] += weight * fraction
+                coverage[parent + mixed_suffix][rows, cols] += weight * fraction
 
     # Land mask: nan outside the modeled area, matching every other feature.
     land = ~np.isnan(block_template.to_numpy())
@@ -292,12 +418,33 @@ def open_building_map_main(
             raster, resolution, block_key, parent, measure
         )
 
-    # Write and release one parent at a time; holding both measures for all eight
-    # parents at once would double peak memory for no benefit.
-    for parent in list(coverage):
-        density = coverage.pop(parent)
-        save(density, parent, "density")
-        save(height * density, parent, "volume")
+    # Write and release one parent at a time; holding both measures for every layer
+    # at once would double peak memory for no benefit. Split by label source, each
+    # parent is checked against the original raster before it is released.
+    checks = []
+    for parent in pcc.OBM_PARENT_BUILDING_TYPES:
+        layers = {
+            layer: coverage.pop(layer)
+            for layer in parent_layers(parent, by_label_source=by_label_source)
+        }
+        for layer, density in layers.items():
+            save(density, layer, "density")
+            save(height * density, layer, "volume")
+        if by_label_source:
+            checks.append(
+                compare_with_reference(
+                    cov_data, resolution, block_key, parent, layers, land
+                )
+            )
+        del layers
+
+    if by_label_source:
+        report = pd.DataFrame(checks)
+        path = cov_data.open_building_map_check_path(resolution, block_key)
+        mkdir(path.parent, exist_ok=True, parents=True)
+        touch(path, clobber=True)
+        report.to_parquet(path, index=False)
+        click.echo(report.to_string(index=False))
 
 
 @click.command()
@@ -305,13 +452,22 @@ def open_building_map_main(
 @clio.with_obm_block_key()
 @clio.with_input_directory("raw_covariate", pcc.RAW_COVARIATES_ROOT)
 @clio.with_output_directory(pcc.COVARIATES_ROOT)
+@click.option(
+    "--by-label-source",
+    is_flag=True,
+    help=(
+        "Split each labelled parent into tagged and inherited layers, using the "
+        "label source extract, and check the split against the original rasters."
+    ),
+)
 @clio.with_progress_bar()
-def open_building_map_task(
+def open_building_map_task(  # noqa: PLR0913
     obm_resolution: str,
     obm_block_key: str,
     raw_covariate_dir: str,
     output_dir: str,
     *,
+    by_label_source: bool = False,
     progress_bar: bool = False,
 ) -> None:
     """Rasterize Open Building Map footprints for one block."""
@@ -320,6 +476,7 @@ def open_building_map_task(
         obm_block_key,
         raw_covariate_dir,
         output_dir,
+        by_label_source=by_label_source,
         progress_bar=progress_bar,
     )
 
@@ -328,12 +485,22 @@ def open_building_map_task(
 @clio.with_obm_resolution(allow_all=True)
 @clio.with_input_directory("raw_covariate", pcc.RAW_COVARIATES_ROOT)
 @clio.with_output_directory(pcc.COVARIATES_ROOT)
+@click.option(
+    "--by-label-source",
+    is_flag=True,
+    help=(
+        "Split each labelled parent into tagged and inherited layers, using the "
+        "label source extract, and check the split against the original rasters."
+    ),
+)
 @clio.with_queue()
 def open_building_map(
     obm_resolution: list[str],
     raw_covariate_dir: str,
     output_dir: str,
     queue: str,
+    *,
+    by_label_source: bool = False,
 ) -> None:
     """Rasterize Open Building Map footprints by block and parent building type."""
     from rra_population_model.data import PopulationModelData
@@ -343,6 +510,21 @@ def open_building_map(
     pm_data = PopulationModelData()
 
     local_quadkeys = list_local_quadkeys(rcov_data)
+    if by_label_source:
+        # A block reads every tile it overlaps, so a partial extract would leave
+        # some blocks failing and others written. Require all of it up front.
+        unclassified = [
+            quadkey
+            for quadkey in local_quadkeys
+            if not cov_data.open_building_map_classified_path(quadkey).exists()
+        ]
+        if unclassified:
+            msg = (
+                f"{len(unclassified)} of {len(local_quadkeys)} tiles have no label "
+                f"source classification (e.g. {unclassified[:5]}). Run 'pcrun "
+                "extract open_building_map_label_source' to completion first."
+            )
+            raise FileNotFoundError(msg)
     obm_extent = gpd.GeoDataFrame(
         {"quadkey": list(local_quadkeys)},
         geometry=list(local_quadkeys.values()),
@@ -367,11 +549,15 @@ def open_building_map(
         task_args={
             "raw-covariate-dir": raw_covariate_dir,
             "output-dir": output_dir,
+            # A value of None renders as a bare command line flag.
+            **({"by-label-source": None} if by_label_source else {}),
         },
         task_resources={
             "queue": queue,
-            "memory": "30G",
-            "runtime": "4h",
+            # 15 accumulators instead of 8, plus the per-tile label source arrays.
+            "memory": "50G" if by_label_source else "30G",
+            # The slowest unsplit 40m block took 2h47m; splitting adds up to ~1.8x.
+            "runtime": "8h" if by_label_source else "4h",
             "project": "proj_rapidresponse",
         },
         max_attempts=3,
