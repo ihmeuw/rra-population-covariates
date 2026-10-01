@@ -155,6 +155,53 @@ def read_tile_buildings(
     return buildings.to_crs(target_crs)
 
 
+def fine_mask(
+    geometries: gpd.GeoSeries,
+    out_shape: tuple[int, int],
+    transform: Affine,
+    factor: int = pcc.OBM_SUPERSAMPLE_FACTOR,
+) -> np.ndarray:
+    """Rasterize the geometries onto a grid `factor` times finer, as a 0/1 mask.
+
+    Overlapping geometries are unioned: a subpixel is 1 however many cover it.
+    """
+    fine_shape = (out_shape[0] * factor, out_shape[1] * factor)
+    if geometries.empty:
+        # rasterize rejects an empty shape list; one half of a split can be empty.
+        return np.zeros(fine_shape, dtype=np.uint8)
+    fine_transform = Affine(
+        transform.a / factor,
+        transform.b,
+        transform.c,
+        transform.d,
+        transform.e / factor,
+        transform.f,
+    )
+    fine = rasterize(
+        [(geom, 1) for geom in geometries],
+        out_shape=fine_shape,
+        transform=fine_transform,
+        fill=0,
+        all_touched=False,
+        dtype="uint8",
+    )
+    return cast("np.ndarray[Any, Any]", fine)
+
+
+def average_down(
+    fine: np.ndarray,
+    out_shape: tuple[int, int],
+    factor: int = pcc.OBM_SUPERSAMPLE_FACTOR,
+) -> np.ndarray:
+    """Average each `factor` x `factor` block of a fine mask down to one pixel."""
+    averaged = (
+        fine.reshape(out_shape[0], factor, out_shape[1], factor)
+        .mean(axis=(1, 3))
+        .astype(np.float32)
+    )
+    return cast("np.ndarray[Any, Any]", averaged)
+
+
 def coverage_fraction(
     geometries: gpd.GeoSeries,
     out_shape: tuple[int, int],
@@ -167,28 +214,29 @@ def coverage_fraction(
     times finer and average each block of subpixels back down. This preserves
     footprint area, which a binary rasterization at the target resolution cannot.
     """
-    fine_transform = Affine(
-        transform.a / factor,
-        transform.b,
-        transform.c,
-        transform.d,
-        transform.e / factor,
-        transform.f,
+    return average_down(
+        fine_mask(geometries, out_shape, transform, factor), out_shape, factor
     )
-    fine = rasterize(
-        [(geom, 1) for geom in geometries],
-        out_shape=(out_shape[0] * factor, out_shape[1] * factor),
-        transform=fine_transform,
-        fill=0,
-        all_touched=False,
-        dtype="uint8",
-    )
-    averaged = (
-        fine.reshape(out_shape[0], factor, out_shape[1], factor)
-        .mean(axis=(1, 3))
-        .astype(np.float32)
-    )
-    return cast("np.ndarray[Any, Any]", averaged)
+
+
+def split_coverage_fraction(
+    tagged: gpd.GeoSeries,
+    inherited: gpd.GeoSeries,
+    out_shape: tuple[int, int],
+    transform: Affine,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Get the tagged and inherited coverage of one parent, with tagged winning.
+
+    Both halves are rasterized on the fine grid before either is averaged, and
+    inherited is masked by tagged there. Ground under both is therefore counted once,
+    as tagged: a footprint's own label is stronger evidence than its zone's, and it
+    is the building:part case, where an untagged part sits inside a tagged outline.
+    The two halves then sum exactly to the unsplit coverage.
+    """
+    fine_tagged = fine_mask(tagged, out_shape, transform)
+    fine_inherited = fine_mask(inherited, out_shape, transform)
+    fine_inherited[fine_tagged.astype(bool)] = 0
+    return average_down(fine_tagged, out_shape), average_down(fine_inherited, out_shape)
 
 
 def building_height(
@@ -242,9 +290,8 @@ def compare_with_reference(  # noqa: PLR0913
 ) -> dict[str, Any]:
     """Compare a parent's split layers, summed, with the original unsplit raster.
 
-    The sum should match except where a tagged and an inherited footprint of the
-    same parent overlap: those were unioned in one layer before and are now in two,
-    so the split sum can be slightly higher there.
+    Tagged masks inherited on the fine grid, so the two halves sum to the unsplit
+    coverage and should match to float32 rounding.
     """
     density = sum(layers.values())
     row: dict[str, Any] = {
@@ -366,24 +413,31 @@ def open_building_map_main(  # noqa: C901, PLR0913, PLR0915
         rows = slice(row_off, row_off + n_rows)
         cols = slice(col_off, col_off + n_cols)
 
-        # Codes that belong wholly to one parent are rasterized together per layer,
-        # so overlapping footprints of the same layer are unioned rather than summed.
+        # Codes that belong wholly to one parent are rasterized together per parent,
+        # so overlapping footprints of the same parent are unioned rather than summed.
+        # Split by label source, tagged and inherited are rasterized together too,
+        # with tagged winning where they overlap.
         # The mixed-use codes contribute a fraction to each of two parents, so each is
         # rasterized on its own and scaled by its weight.
         is_mixed = buildings["occupancy"].isin(pcc.OBM_MIXED_USE_SPLITS)
         whole, mixed = buildings[~is_mixed], buildings[is_mixed]
 
-        whole_layer = whole["parent_building_type"]
-        if by_label_source:
+        for parent, group in whole.groupby("parent_building_type"):
             # unknown is a parent and a label source at once, and is not split.
-            whole_layer = whole_layer.where(
-                whole["label_source"] == "unknown",
-                whole_layer + "_" + whole["label_source"],
+            if not by_label_source or parent == "unknown":
+                coverage[parent][rows, cols] += coverage_fraction(
+                    group.geometry, tile_shape, tile_transform
+                )
+                continue
+            is_tagged = group["label_source"] == "tagged"
+            tagged, inherited = split_coverage_fraction(
+                group.geometry[is_tagged],
+                group.geometry[~is_tagged],
+                tile_shape,
+                tile_transform,
             )
-        for layer, group in whole.groupby(whole_layer):
-            coverage[layer][rows, cols] += coverage_fraction(
-                group.geometry, tile_shape, tile_transform
-            )
+            coverage[f"{parent}_tagged"][rows, cols] += tagged
+            coverage[f"{parent}_inherited"][rows, cols] += inherited
 
         for code, group in mixed.groupby("occupancy"):
             fraction = coverage_fraction(group.geometry, tile_shape, tile_transform)
