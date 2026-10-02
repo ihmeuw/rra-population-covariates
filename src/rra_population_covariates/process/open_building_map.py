@@ -112,12 +112,49 @@ class LabelSourceLookup:
         return cast("np.ndarray[Any, Any]", labels[codes[fid]])
 
 
-def read_tile_buildings(
+EFFECTIVE_COLUMNS = [
+    "parent_1",
+    "weight_1",
+    "source_1",
+    "parent_2",
+    "weight_2",
+    "source_2",
+]
+
+
+class EffectiveOccupancyLookup:
+    """The effective-occupancy corrections of every tile, by GeoPackage fid.
+
+    The tables are sparse, holding only the footprints a rule touched, so each is
+    small enough to keep for the whole block.
+    """
+
+    def __init__(self, cov_data: CovariateData) -> None:
+        self._cov_data = cov_data
+        self._tiles: dict[str, pd.DataFrame] = {}
+
+    def get(self, quadkey: str, fid: np.ndarray) -> pd.DataFrame:
+        if quadkey not in self._tiles:
+            path = self._cov_data.open_building_map_effective_path(quadkey)
+            if not path.exists():
+                msg = (
+                    f"{path} not found. Run 'pcrun extract "
+                    "open_building_map_effective_occupancy' first."
+                )
+                raise FileNotFoundError(msg)
+            self._tiles[quadkey] = pd.read_parquet(
+                path, columns=["fid", *EFFECTIVE_COLUMNS]
+            ).set_index("fid")
+        return self._tiles[quadkey].reindex(fid)
+
+
+def read_tile_buildings(  # noqa: PLR0913
     rcov_data: RawCovariateData,
     quadkeys: list[str],
     bounds: tuple[float, float, float, float],
     target_crs: str,
     label_sources: LabelSourceLookup | None = None,
+    effective: EffectiveOccupancyLookup | None = None,
 ) -> gpd.GeoDataFrame | None:
     """Read the buildings intersecting a bounding box, tagged by parent type.
 
@@ -136,10 +173,11 @@ def read_tile_buildings(
             fid_as_index=True,
         )
         if not gdf.empty:
+            fid = gdf.index.to_numpy(dtype=np.int64)
             if label_sources is not None:
-                gdf["label_source"] = label_sources.get(
-                    quadkey, gdf.index.to_numpy(dtype=np.int64)
-                )
+                gdf["label_source"] = label_sources.get(quadkey, fid)
+            if effective is not None:
+                gdf[EFFECTIVE_COLUMNS] = effective.get(quadkey, fid).to_numpy()
             frames.append(gdf)
 
     if not frames:
@@ -217,6 +255,41 @@ def coverage_fraction(
     return average_down(
         fine_mask(geometries, out_shape, transform, factor), out_shape, factor
     )
+
+
+def weighted_coverage_fraction(
+    geometries: gpd.GeoSeries,
+    weights: np.ndarray,
+    out_shape: tuple[int, int],
+    transform: Affine,
+    factor: int = pcc.OBM_SUPERSAMPLE_FACTOR,
+) -> np.ndarray:
+    """Get each pixel's coverage by geometries that each count for a fraction.
+
+    Each footprint is burnt into the fine grid at its weight in percent, so where
+    weighted footprints overlap the last one wins, as a union would for whole ones.
+    """
+    fine_transform = Affine(
+        transform.a / factor,
+        transform.b,
+        transform.c,
+        transform.d,
+        transform.e / factor,
+        transform.f,
+    )
+    percent = np.rint(np.asarray(weights, dtype=np.float64) * 100).astype(np.uint8)
+    shapes = [(g, int(w)) for g, w in zip(geometries, percent, strict=True) if w > 0]
+    if not shapes:
+        return np.zeros(out_shape, dtype=np.float32)
+    fine = rasterize(
+        shapes,
+        out_shape=(out_shape[0] * factor, out_shape[1] * factor),
+        transform=fine_transform,
+        fill=0,
+        all_touched=False,
+        dtype="uint8",
+    )
+    return cast("np.ndarray[Any, Any]", average_down(fine, out_shape, factor) / 100)
 
 
 def split_coverage_fraction(
@@ -333,13 +406,47 @@ def compare_with_reference(  # noqa: PLR0913
     return row
 
 
-def open_building_map_main(  # noqa: C901, PLR0913, PLR0915
+def compare_with_split(
+    cov_data: CovariateData,
+    resolution: str,
+    block_key: str,
+    layers: dict[str, np.ndarray],
+    land: np.ndarray,
+) -> list[dict[str, Any]]:
+    """Compare each effective-occupancy layer with the same layer of the split run.
+
+    The corrections move density between parents and label sources, so per-layer
+    totals change by design; summed over all layers they should barely move.
+    """
+    rows = []
+    for layer, array in layers.items():
+        path = cov_data.open_building_map_split_reference_raster_path(
+            resolution, block_key, layer, "density"
+        )
+        current = (
+            float(np.nansum(np.where(land, rt.load_raster(path).to_numpy(), 0.0)))
+            if path.exists()
+            else np.nan
+        )
+        rows.append(
+            {
+                "block_key": block_key,
+                "layer": layer,
+                "density_effective": float(np.where(land, array, 0.0).sum()),
+                "density_split": current,
+            }
+        )
+    return rows
+
+
+def open_building_map_main(  # noqa: C901, PLR0912, PLR0913, PLR0915
     resolution: str,
     block_key: str,
     raw_covariate_dir: str,
     output_dir: str,
     *,
     by_label_source: bool = False,
+    effective_occupancy: bool = False,
     progress_bar: bool = False,
 ) -> None:
     from rra_population_model.data import (
@@ -373,7 +480,10 @@ def open_building_map_main(  # noqa: C901, PLR0913, PLR0915
 
     # One accumulator per layer, covering the whole block: a layer per parent type,
     # or split by label source a tagged and an inherited layer per labelled parent.
+    # The effective occupancy is applied on top of the label-source split.
+    by_label_source = by_label_source or effective_occupancy
     label_sources = LabelSourceLookup(cov_data) if by_label_source else None
+    effective = EffectiveOccupancyLookup(cov_data) if effective_occupancy else None
     coverage = {
         layer: np.zeros(block_shape, dtype=np.float32)
         for parent in pcc.OBM_PARENT_BUILDING_TYPES
@@ -396,7 +506,12 @@ def open_building_map_main(  # noqa: C901, PLR0913, PLR0915
             continue
 
         buildings = read_tile_buildings(
-            rcov_data, quadkeys, bounds, model_frame.crs.to_string(), label_sources
+            rcov_data,
+            quadkeys,
+            bounds,
+            model_frame.crs.to_string(),
+            label_sources,
+            effective,
         )
         if buildings is None:
             continue
@@ -419,6 +534,22 @@ def open_building_map_main(  # noqa: C901, PLR0913, PLR0915
         # with tagged winning where they overlap.
         # The mixed-use codes contribute a fraction to each of two parents, so each is
         # rasterized on its own and scaled by its weight.
+        weighted = None
+        if effective is not None:
+            # A whole correction rests on the footprint's own class, a group-quarters
+            # site, place or name, never on OBM's zone, so it is tagged and replaces
+            # the parent. Fractional ones carry a label source per share and are
+            # rasterized by weight below.
+            corrected = buildings["parent_1"].notna()
+            fractional = corrected & buildings["parent_2"].notna()
+            to_whole = corrected & ~fractional
+            buildings.loc[to_whole, "parent_building_type"] = buildings.loc[
+                to_whole, "parent_1"
+            ]
+            buildings.loc[to_whole, "label_source"] = "tagged"
+            buildings.loc[to_whole, "occupancy"] = pcc.OBM_GROUP_QUARTERS_CODE
+            weighted, buildings = buildings[fractional], buildings[~fractional]
+
         is_mixed = buildings["occupancy"].isin(pcc.OBM_MIXED_USE_SPLITS)
         whole, mixed = buildings[~is_mixed], buildings[is_mixed]
 
@@ -443,6 +574,27 @@ def open_building_map_main(  # noqa: C901, PLR0913, PLR0915
             fraction = coverage_fraction(group.geometry, tile_shape, tile_transform)
             for parent, weight in pcc.OBM_MIXED_USE_SPLITS[code].items():
                 coverage[parent + mixed_suffix][rows, cols] += weight * fraction
+
+        if weighted is not None and not weighted.empty:
+            share_layers = {
+                f"{p}_{s}"
+                for k in ("1", "2")
+                for p, s in zip(
+                    weighted[f"parent_{k}"], weighted[f"source_{k}"], strict=True
+                )
+            }
+            for layer in share_layers:
+                weights = np.zeros(len(weighted))
+                for k in ("1", "2"):
+                    weights += np.where(
+                        (weighted[f"parent_{k}"] + "_" + weighted[f"source_{k}"])
+                        == layer,
+                        weighted[f"weight_{k}"].astype(np.float64),
+                        0.0,
+                    )
+                coverage[layer][rows, cols] += weighted_coverage_fraction(
+                    weighted.geometry, weights, tile_shape, tile_transform
+                )
 
     # Land mask: nan outside the modeled area, matching every other feature.
     land = ~np.isnan(block_template.to_numpy())
@@ -484,7 +636,11 @@ def open_building_map_main(  # noqa: C901, PLR0913, PLR0915
         for layer, density in layers.items():
             save(density, layer, "density")
             save(height * density, layer, "volume")
-        if by_label_source:
+        if effective_occupancy:
+            checks.extend(
+                compare_with_split(cov_data, resolution, block_key, layers, land)
+            )
+        elif by_label_source:
             checks.append(
                 compare_with_reference(
                     cov_data, resolution, block_key, parent, layers, land
@@ -514,6 +670,14 @@ def open_building_map_main(  # noqa: C901, PLR0913, PLR0915
         "label source extract, and check the split against the original rasters."
     ),
 )
+@click.option(
+    "--effective-occupancy",
+    is_flag=True,
+    help=(
+        "Apply the effective-occupancy corrections on top of the label-source split, "
+        f"and check each block against {pcc.OBM_SPLIT_REFERENCE_DIRNAME}."
+    ),
+)
 @clio.with_progress_bar()
 def open_building_map_task(  # noqa: PLR0913
     obm_resolution: str,
@@ -522,6 +686,7 @@ def open_building_map_task(  # noqa: PLR0913
     output_dir: str,
     *,
     by_label_source: bool = False,
+    effective_occupancy: bool = False,
     progress_bar: bool = False,
 ) -> None:
     """Rasterize Open Building Map footprints for one block."""
@@ -531,6 +696,7 @@ def open_building_map_task(  # noqa: PLR0913
         raw_covariate_dir,
         output_dir,
         by_label_source=by_label_source,
+        effective_occupancy=effective_occupancy,
         progress_bar=progress_bar,
     )
 
@@ -547,14 +713,23 @@ def open_building_map_task(  # noqa: PLR0913
         "label source extract, and check the split against the original rasters."
     ),
 )
+@click.option(
+    "--effective-occupancy",
+    is_flag=True,
+    help=(
+        "Apply the effective-occupancy corrections on top of the label-source split, "
+        f"and check each block against {pcc.OBM_SPLIT_REFERENCE_DIRNAME}."
+    ),
+)
 @clio.with_queue()
-def open_building_map(
+def open_building_map(  # noqa: PLR0913
     obm_resolution: list[str],
     raw_covariate_dir: str,
     output_dir: str,
     queue: str,
     *,
     by_label_source: bool = False,
+    effective_occupancy: bool = False,
 ) -> None:
     """Rasterize Open Building Map footprints by block and parent building type."""
     from rra_population_model.data import PopulationModelData
@@ -564,6 +739,7 @@ def open_building_map(
     pm_data = PopulationModelData()
 
     local_quadkeys = list_local_quadkeys(rcov_data)
+    by_label_source = by_label_source or effective_occupancy
     if by_label_source:
         # A block reads every tile it overlaps, so a partial extract would leave
         # some blocks failing and others written. Require all of it up front.
@@ -577,6 +753,19 @@ def open_building_map(
                 f"{len(unclassified)} of {len(local_quadkeys)} tiles have no label "
                 f"source classification (e.g. {unclassified[:5]}). Run 'pcrun "
                 "extract open_building_map_label_source' to completion first."
+            )
+            raise FileNotFoundError(msg)
+    if effective_occupancy:
+        uncorrected = [
+            quadkey
+            for quadkey in local_quadkeys
+            if not cov_data.open_building_map_effective_path(quadkey).exists()
+        ]
+        if uncorrected:
+            msg = (
+                f"{len(uncorrected)} of {len(local_quadkeys)} tiles have no effective "
+                "occupancy table. Run 'pcrun extract "
+                "open_building_map_effective_occupancy' to completion first."
             )
             raise FileNotFoundError(msg)
     obm_extent = gpd.GeoDataFrame(
@@ -605,6 +794,7 @@ def open_building_map(
             "output-dir": output_dir,
             # A value of None renders as a bare command line flag.
             **({"by-label-source": None} if by_label_source else {}),
+            **({"effective-occupancy": None} if effective_occupancy else {}),
         },
         task_resources={
             "queue": queue,

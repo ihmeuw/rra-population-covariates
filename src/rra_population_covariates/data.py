@@ -27,6 +27,11 @@ class RawCovariateData:
         return list(Path(root).glob("*.parquet"))
 
     @property
+    def osm_planet(self) -> Path:
+        # Dated 2025-04-18, 14 days after the OBM snapshot.
+        return self._root / "osm" / "planet-latest.osm.pbf"
+
+    @property
     def logs(self) -> Path:
         return self._root / "logs"
 
@@ -125,7 +130,12 @@ class CovariateData:
 
     @property
     def open_building_map(self) -> Path:
-        return self._root / "open_building_map" / pcc.OBM_VERSION
+        return self.open_building_map_version(pcc.OBM_VERSION)
+
+    def open_building_map_version(self, version: str) -> Path:
+        # Covariate versions sit side by side, e.g. 2025-04-04 and
+        # 2025-04-04_effective_occupancy.
+        return self._root / "open_building_map" / version
 
     def open_building_map_raster_path(
         self,
@@ -133,27 +143,29 @@ class CovariateData:
         block_key: str,
         parent_building_type: str,
         measure: str,
+        version: str = pcc.OBM_VERSION,
     ) -> Path:
         if measure not in pcc.OBM_MEASURES:
             msg = f"Unknown measure {measure!r}; expected one of {pcc.OBM_MEASURES}."
             raise ValueError(msg)
         return (
-            self.open_building_map
+            self.open_building_map_version(version)
             / f"{resolution}m"
             / block_key
             / f"{parent_building_type}_{measure}.tif"
         )
 
-    def save_open_building_map_raster(
+    def save_open_building_map_raster(  # noqa: PLR0913
         self,
         raster: "rt.RasterArray",
         resolution: str,
         block_key: str,
         parent_building_type: str,
         measure: str,
+        version: str = pcc.OBM_VERSION,
     ) -> None:
         path = self.open_building_map_raster_path(
-            resolution, block_key, parent_building_type, measure
+            resolution, block_key, parent_building_type, measure, version
         )
         mkdir(path.parent, exist_ok=True, parents=True)
         save_raster(raster, path)
@@ -176,10 +188,28 @@ class CovariateData:
             / f"{parent_building_type}_{measure}.tif"
         )
 
-    def open_building_map_check_path(self, resolution: str, block_key: str) -> Path:
+    def open_building_map_split_reference_raster_path(
+        self,
+        resolution: str,
+        block_key: str,
+        layer: str,
+        measure: str,
+    ) -> Path:
+        return (
+            self._root
+            / pcc.OBM_SPLIT_REFERENCE_DIRNAME
+            / pcc.OBM_VERSION
+            / f"{resolution}m"
+            / block_key
+            / f"{layer}_{measure}.tif"
+        )
+
+    def open_building_map_check_path(
+        self, resolution: str, block_key: str, version: str = pcc.OBM_VERSION
+    ) -> Path:
         # Kept out of the resolution directory, which holds only block directories.
         return (
-            self.open_building_map
+            self.open_building_map_version(version)
             / "label_source_checks"
             / f"{resolution}m"
             / f"{block_key}.parquet"
@@ -199,6 +229,14 @@ class CovariateData:
             / "summary"
             / f"building.{quadkey}.parquet"
         )
+
+    @property
+    def open_building_map_effective(self) -> Path:
+        return self._root / "open_building_map_effective_occupancy"
+
+    def open_building_map_effective_path(self, quadkey: str) -> Path:
+        # Sparse: only the footprints whose occupancy a rule changed.
+        return self.open_building_map_effective / f"building.{quadkey}.parquet"
 
     @property
     def overture(self) -> Path:
