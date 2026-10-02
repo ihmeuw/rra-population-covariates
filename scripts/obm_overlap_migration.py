@@ -6,12 +6,18 @@ overlap, which makes the correct inherited layer
 
     inherited = clip(original - tagged, 0, inherited)
 
-where `original` is the unsplit raster in `_open_building_map/`. This rewrites only the
+where `original` is the unsplit raster (run 1). This rewrites only the
 block-parent pairs whose Step B check found any overlap (`n_differ > 0`); every other
 pair already equals `original - tagged`. Step B itself now masks inherited by tagged
 on the fine grid (`process/open_building_map.py`), so a rerun needs none of this.
 
 See HANDOFF_OBM_STEP_B_FIX.md (rra_pop_cov handoffs), section 3.
+
+Applied once, on 2026-10-01, to run 2 of the covariate. Run 2 has since moved to
+`_open_building_map_SPLIT/` and run 1 to `_open_building_map_UNSPLIT/`, and the path
+the model reads, `open_building_map/`, now holds run 3 (the effective-occupancy
+rules), which never had the overlap. The paths below follow run 2, so a rerun finds
+every block already fixed and does nothing; it must never point at `open_building_map/`.
 
 Usage:
     python obm_overlap_migration.py list                      # pairs and blocks in scope
@@ -40,7 +46,7 @@ from rra_population_covariates.data import CovariateData, save_raster
 
 ROOT = Path(pcc.COVARIATES_ROOT)
 RESOLUTION = "40"
-LIVE = ROOT / "open_building_map" / pcc.OBM_VERSION
+LIVE = ROOT / pcc.OBM_SPLIT_REFERENCE_DIRNAME / pcc.OBM_VERSION
 CHECKS = LIVE / "label_source_checks" / f"{RESOLUTION}m"
 FIXED = LIVE / "label_source_checks" / f"{RESOLUTION}m_overlap_fixed"
 BACKUP = LIVE / "inherited_prefix_backup" / f"{RESOLUTION}m"

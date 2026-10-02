@@ -130,12 +130,7 @@ class CovariateData:
 
     @property
     def open_building_map(self) -> Path:
-        return self.open_building_map_version(pcc.OBM_VERSION)
-
-    def open_building_map_version(self, version: str) -> Path:
-        # Covariate versions sit side by side, e.g. 2025-04-04 and
-        # 2025-04-04_effective_occupancy.
-        return self._root / "open_building_map" / version
+        return self._root / "open_building_map" / pcc.OBM_VERSION
 
     def open_building_map_raster_path(
         self,
@@ -143,29 +138,27 @@ class CovariateData:
         block_key: str,
         parent_building_type: str,
         measure: str,
-        version: str = pcc.OBM_VERSION,
     ) -> Path:
         if measure not in pcc.OBM_MEASURES:
             msg = f"Unknown measure {measure!r}; expected one of {pcc.OBM_MEASURES}."
             raise ValueError(msg)
         return (
-            self.open_building_map_version(version)
+            self.open_building_map
             / f"{resolution}m"
             / block_key
             / f"{parent_building_type}_{measure}.tif"
         )
 
-    def save_open_building_map_raster(  # noqa: PLR0913
+    def save_open_building_map_raster(
         self,
         raster: "rt.RasterArray",
         resolution: str,
         block_key: str,
         parent_building_type: str,
         measure: str,
-        version: str = pcc.OBM_VERSION,
     ) -> None:
         path = self.open_building_map_raster_path(
-            resolution, block_key, parent_building_type, measure, version
+            resolution, block_key, parent_building_type, measure
         )
         mkdir(path.parent, exist_ok=True, parents=True)
         save_raster(raster, path)
@@ -204,12 +197,10 @@ class CovariateData:
             / f"{layer}_{measure}.tif"
         )
 
-    def open_building_map_check_path(
-        self, resolution: str, block_key: str, version: str = pcc.OBM_VERSION
-    ) -> Path:
+    def open_building_map_check_path(self, resolution: str, block_key: str) -> Path:
         # Kept out of the resolution directory, which holds only block directories.
         return (
-            self.open_building_map_version(version)
+            self.open_building_map
             / "label_source_checks"
             / f"{resolution}m"
             / f"{block_key}.parquet"
