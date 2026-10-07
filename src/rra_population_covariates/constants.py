@@ -277,3 +277,176 @@ OBM_HEIGHT_TIME_POINT = "2025q1"
 # reports surface. The affected pixels are those where OBM has footprints and GHSL has
 # nothing, and the per-block count is logged so the total is reportable.
 OBM_ONE_STOREY_HEIGHT_M = 2.5
+
+# Label source: whether a footprint's occupancy is the building's own or was inherited
+# from the OSM land-use zone it sits in. OBM does not record this, so we reconstruct
+# it from Overture, which repackages the same OSM data:
+#
+#   unknown    occupancy is UNK.
+#   inherited  labelled, no own OSM building class, and the centroid lies in a land-use
+#              zone that maps to the same parent as the label.
+#   tagged     every other labelled footprint: its own tag, a point of interest, or
+#              another OBM rule. The mixed-use codes are always tagged, since a single
+#              zone cannot supply two uses.
+OBM_LABEL_SOURCES = ["tagged", "inherited"]
+
+# Overture land-use classes mapped to parent building types. This reproduces the
+# `landuse` rows of OBM's B_building_and_POI_tags.csv, leaving out those OBM marks
+# UNDECIDABLE. Five of these classes (mine, leisure, farm, greenhouse, government)
+# are absent from Overture 2025-04-23.0: Overture drops those OSM landuse values
+# rather than renaming them, so footprints in such zones come out tagged. They are
+# kept here so the extract reports them as missing rather than hiding the gap.
+OBM_LAND_USE_PARENTS = {
+    **dict.fromkeys(["residential", "allotments", "garages"], "residential_mu"),
+    **dict.fromkeys(
+        ["industrial", "landfill", "mine", "quarry", "works"], "industrial"
+    ),
+    **dict.fromkeys(
+        ["commercial", "retail", "recreation_ground", "leisure"], "commercial"
+    ),
+    **dict.fromkeys(
+        [
+            "farm",
+            "farmland",
+            "farmyard",
+            "meadow",
+            "orchard",
+            "vineyard",
+            "plant_nursery",
+            "animal_keeping",
+            "greenhouse",
+            "greenhouse_horticulture",
+        ],
+        "agriculture",
+    ),
+    **dict.fromkeys(["military", "government"], "government"),
+    **dict.fromkeys(["education", "school"], "education"),
+    "religious": "assembly",
+}
+
+# Open Building Map's tiles are zoom-6 quadkeys. The Overture lookups are partitioned
+# on the same tiles so that each classification task reads only its own tile.
+OBM_QUADKEY_ZOOM = 6
+# Centroids are taken in an equal-area projection, then joined in EPSG:4326.
+OBM_EQUAL_AREA_CRS = "ESRI:54034"
+# The largest tile holds about 100M footprints (31 GB), so tiles are read in chunks.
+OBM_CLASSIFY_CHUNK_SIZE = 2_000_000
+
+# Rasterizing by label source splits every labelled parent into a tagged and an
+# inherited layer, so each block gets 15 layers (30 rasters) instead of 8. unknown is
+# not split. A model wanting the original parent layer adds the two halves.
+OBM_LABEL_SOURCE_LAYERS = [
+    *(
+        f"{parent}_{source}"
+        for parent in OBM_PARENT_BUILDING_TYPES
+        if parent != "unknown"
+        for source in OBM_LABEL_SOURCES
+    ),
+    "unknown",
+]
+
+# Earlier covariate runs, moved aside so each new run can write to the usual location
+# that the population model reads:
+#   _open_building_map_UNSPLIT  the first run, eight parent layers
+#   _open_building_map_SPLIT    the label-source split, with the overlap fix
+# The split run checks itself against the unsplit one, and the effective-occupancy
+# run against the split one, block by block.
+OBM_REFERENCE_DIRNAME = "_open_building_map_UNSPLIT"
+OBM_SPLIT_REFERENCE_DIRNAME = "_open_building_map_SPLIT"
+# Pixels whose split sum differs from the reference by more than this count as
+# differing. The rasters are float32 fractions with 1/100 precision.
+OBM_CHECK_TOLERANCE = 1e-5
+
+# Effective occupancy: corrections to OBM's labels, applied per footprint on top of
+# the label-source split and written as a separate covariate version. Each rule names
+# the evidence it trusts over OBM's label; footprints no rule touches keep OBM's.
+# Group quarters: people the census counts as residents, in buildings OBM often files
+# as education, assembly or government. All become institutional housing.
+OBM_GROUP_QUARTERS_CODE = "RES4"
+# Explicit OSM building classes (via Overture) that are group quarters. Military is
+# deliberately absent: it covers whole bases, not only housing, and needs its own
+# investigation.
+OBM_GROUP_QUARTERS_CLASSES = ["dormitory", "presbytery", "monastery"]
+# A group-quarters site, place or name relabels a footprint only if its own class is
+# residential, absent, or one of these classes that a barracks, prison or monastery
+# building commonly carries. Any other explicit class (a chapel, a garage, a
+# workshop) is a better description of that building and is kept.
+OBM_GROUP_QUARTERS_COMPATIBLE_CLASSES = [
+    "military",
+    "public",
+    "civic",
+    "government",
+    "religious",
+]
+# OSM site polygons whose buildings are group quarters, as (key, value) tags. OBM
+# reads none of these as an area, so a prison or barracks compound mapped as a site
+# never labels the buildings inside it. Social facilities count only for the
+# social_facility values in OBM_GROUP_QUARTERS_SOCIAL_FACILITIES.
+OBM_GROUP_QUARTERS_SITE_TAGS = [
+    ("amenity", "prison"),
+    ("military", "barracks"),
+    ("amenity", "monastery"),
+    ("amenity", "nursing_home"),
+    ("amenity", "social_facility"),
+]
+OBM_GROUP_QUARTERS_SOCIAL_FACILITIES = [
+    "nursing_home",
+    "assisted_living",
+    "group_home",
+    "shelter",
+]
+# Overture place categories that are group quarters. Hospices, rehabilitation centres
+# and hostels are left out: short stays, not census residents.
+OBM_GROUP_QUARTERS_PLACES = [
+    "jail_and_prison",
+    "juvenile_detention_center",
+    "retirement_home",
+    "assisted_living_facility",
+    "skilled_nursing",
+    "homeless_shelter",
+    "halfway_house",
+    "convents_and_monasteries",
+]
+# Building names (OSM name, via Overture) that mark group quarters, matched
+# case-insensitively, unless an exclusion also matches. Review a sample before use:
+# names produce false positives such as museums in old jails.
+OBM_GROUP_QUARTERS_NAME_PATTERN = (
+    r"\b(jail|gaol|prison|penitentiary|correctional|detention cent(er|re)"
+    r"|justizvollzugsanstalt|jva|gef[aä]ngnis|wi[eę]zienie|zak[lł]ad karny"
+    r"|areszt [sś]ledczy|c[aá]rcel|prisi[oó]n|centro penitenciario"
+    r"|penitenci[aá]ri[ao]|pres[ií]dio|maison d.arr[eê]t|centre p[eé]nitentiaire"
+    r"|carcere|casa circondariale|тюрьма|исправительн|сизо"
+    r"|barracks|kaserne|caserne|cuartel|koszary|казарм"
+    r"|residence hall|dormitor(y|ies)|student (residence|housing|village)"
+    r"|studentenwohnheim|akademik|dom studenta|colegio mayor"
+    r"|r[eé]sidence universitaire"
+    r"|nursing home|care home|retirement home|assisted living|pflegeheim"
+    r"|altenheim|seniorenheim|dom pomocy spo[lł]ecznej|ehpad|maison de retraite"
+    r"|residencia de (ancianos|mayores))\b"
+)
+OBM_GROUP_QUARTERS_NAME_EXCLUDE = (
+    r"\b(museum|muzeum|mus[eé]e|museo|restaurant|hotel|brewery|caf[eé]|pub|bar"
+    r"|shop|store|station|gallery|memorial|ruin"
+    # Day centres share names with care homes but house nobody overnight.
+    r"|dzienny|day ?care|day cent(er|re)|tagespflege|centre de jour|centro de d[ií]a)\b"
+)
+
+# A residential building tag overridden by one of OBM's overriding occupancies is
+# reclassified as mixed use, residential plus the override's parent. Two kinds of
+# override are left alone: whole-site uses, where a residential tag is more likely
+# wrong than the label, and temporary lodging, to be revisited on its own.
+OBM_WHOLE_SITE_CODES = ["ASS2", "COM8", "COM9", "COM10", "EDU4"]
+OBM_OVERRIDES_KEPT = ["RES3"]
+
+# Mostly-residential mixed codes get a floor-based split instead of OBM's fixed 75/25,
+# whatever the building's own tag: their description is taken as the truth. The
+# non-residential use is assumed to take the ground floor, so its share is
+# 1 / floors. The other mixed codes keep OBM_MIXED_USE_SPLITS.
+OBM_MOSTLY_RESIDENTIAL_MIX = ["MIX1", "MIX4"]
+# Floors come from Overture num_floors, else Overture height / this storey height.
+OBM_STOREY_HEIGHT_M = 3.0
+# Residential share where floors are unknown (OBM's own mostly-residential weight) and
+# where the building has a single storey, which the floor rule would make wholly
+# non-residential.
+OBM_UNKNOWN_FLOORS_RESIDENTIAL_SHARE = 0.75
+OBM_SINGLE_STOREY_RESIDENTIAL_SHARE = 0.5

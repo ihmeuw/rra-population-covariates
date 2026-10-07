@@ -129,7 +129,7 @@ Because the weights sum to 1, area is still conserved. Codes belonging wholly to
 
 **A note on values above 1.** Pixel values are fractions and normally fall in `[0, 1]`. A value above 1 means the same ground was counted twice, which happens when an OpenStreetMap building and an ML-derived footprint describe the same structure. It is *not* a signal of building density — several buildings in one pixel is the ordinary case and stays within `[0, 1]`. Measured on the densest test block (29.1M land pixels): zero pixels above 1 in any single layer, and 22 of 1,554,305 covered pixels (0.0014%, max 1.610) when summing all layers. These are left unclipped so the artifact stays visible in QA, which means **consumers must not assume a hard upper bound of 1**.
 
-**Output:** `…/02-processed-data/covariates/open_building_map/<version>/<resolution>m/<block_key>/<parent_building_type>.tif` — float32, `nodata=nan`, `ESRI:54034`, ZSTD-compressed, tiled 512×512, matching the population model's own raster parameters.
+**Output:** `…/02-processed-data/covariates/open_building_map/<version>/<resolution>m/<block_key>/<layer>_<measure>.tif`, where `<measure>` is `density` (covered fraction) or `volume` (GHSL height × density). Rasters are float32, `nodata=nan`, `ESRI:54034`, ZSTD-compressed and tiled 512×512, matching the population model's own raster parameters. Without options, `<layer>` is the parent building type (8 layers, 16 rasters per block). With `--by-label-source` or `--effective-occupancy`, each labelled parent is split into `_tagged` and `_inherited` (15 layers, 30 rasters per block); see below.
 
 **Run both resolutions:**
 
@@ -146,6 +146,138 @@ pctask process open_building_map --obm-resolution 100 --obm-block-key B-0007X-00
 ```
 
 Validation for the rasterized output lives in [notebooks/2026_08_03_validate_obm_rasters.ipynb](notebooks/2026_08_03_validate_obm_rasters.ipynb), which checks structural completeness, grid alignment against the model template, value domain, area conservation recomputed independently from the vectors, the direction of the mixed-use weights, tile-seam integrity, and agreement between the 100 m and 40 m products.
+### Open Building Map — label source (Step A) — [extract/open_building_map_label_source.py](src/rra_population_covariates/extract/open_building_map_label_source.py)
+
+**Why.** OBM labels an untagged footprint from the OSM land-use zone it sits in. An unlabelled outline inside `landuse=industrial` becomes `IND`, for example, and OBM doesn't record when it has done so. Those zone-inherited labels are the weakest OBM has. In the countries where OBM's residential split does worse than GHSL's, they carry most of the volume OBM removes from cities. The population model's `inh*` variants therefore need to know, for every footprint, whether its label is its own or inherited.
+
+**How.** Every footprint in all 1,271 tiles gets one `label_source`:
+
+| `label_source` | Rule, first match wins |
+|---|---|
+| `unknown` | `occupancy == "UNK"` |
+| `tagged` | a mixed-use code (`MIX*`), or the footprint has its own OSM building class |
+| `inherited` | its centroid lies in a land-use zone that maps to the same parent as its label |
+| `tagged` | anything else (labelled from a point of interest or another OBM rule) |
+
+- **Own class.** Taken from Overture 2025-04-23.0 by joining on the OSM ID, not by geometry.
+  - **Relations:** OBM stores a relation's `id` negated, so the lookup stores Overture's `r<id>` the same way. Ways and relations never collide.
+  - **Null class:** a null Overture `class` is OSM `building=yes`, which counts as no own class.
+  - **Building parts:** they have no class in Overture.
+  - **Google and Microsoft footprints** (`source_id` 1 and 2) never have an own class.
+  - **Match rate:** 99.65% of 612.8M OSM footprints matched an Overture record.
+- **Zones.** Overture land-use polygons whose class maps to a parent, per [`OBM_LAND_USE_PARENTS`](src/rra_population_covariates/constants.py). This reproduces OBM's own `landuse` rows in `B_building_and_POI_tags.csv`, leaving out those OBM marks `UNDECIDABLE`. Centroids are taken in `ESRI:54034`.
+
+**Output.**
+- **Per tile:** `…/02-processed-data/covariates/open_building_map_classified/building.<quadkey>.parquet`, with columns `fid` (the GeoPackage fid, which is the join key), `id`, `source_id`, `occupancy`, `parent`, `has_own_class`, `zone_match` and `label_source`.
+- **Summary:** per-tile counts in `summary.parquet`.
+- **Lookups:** in the raw OBM directory, partitioned by quadkey: `overture_buildings/` and `overture_land_use/`.
+
+```sh
+pcrun extract open_building_map_label_source --queue all.q
+```
+
+### Open Building Map — split rasters (Step B)
+
+`pcrun process open_building_map --by-label-source` writes each labelled parent as `{parent}_tagged` and `{parent}_inherited`; `unknown` isn't split.
+- **Overlaps:** a parent's tagged and inherited footprints are rasterized together on the fine grid, with inherited masked by tagged (`split_coverage_fraction`). Ground under both counts once, as tagged, so the two halves sum to the unsplit layer to float32 rounding.
+- **Mixed-use codes:** they go into `_tagged`.
+- **Check tables:** every block gets one in `…/open_building_map/<version>/label_source_checks/<resolution>m/`, comparing it against the unsplit run in `_open_building_map_UNSPLIT/`.
+
+[scripts/obm_overlap_migration.py](scripts/obm_overlap_migration.py) is the one-time fix applied on 2026-10-01 to rasters written before the masking existed. It's kept for the record, and points at `_open_building_map_SPLIT/`, so a rerun does nothing.
+
+### Open Building Map — effective occupancy — [extract/open_building_map_effective_occupancy.py](src/rra_population_covariates/extract/open_building_map_effective_occupancy.py)
+
+**Why.** Audits of OBM's labels against Overture and OSM found three systematic problems that matter for a residential covariate:
+- **Group quarters are filed as non-residential.** Barracks, prisons, care homes, residence halls and monasteries hold census population but mostly carry government, education, assembly or `UNK` labels.
+- **OBM's overriding occupancies replace a building's own residential tag.** A ground-floor clinic turns an apartment block into `COM4`, for example.
+- **OBM's mixed-use codes take their dominant use from the zone.** Most `MIX` labels sit in a zone of their dominant use, so that share is zone-derived, not tagged.
+
+**Rules.** They're applied per footprint, first match wins. A footprint no rule touches keeps OBM's label and its Step A label source.
+
+| # | Rule | Result | Sources |
+|---|---|---|---|
+| 1 | Own OSM class `dormitory`, `presbytery` or `monastery` | `RES4` (institutional housing), tagged | OSM |
+| 2 | Centroid in an OSM group-quarters site polygon: `amenity=prison`, `military=barracks`, `amenity=monastery`, `amenity=nursing_home`, or `amenity=social_facility` with `social_facility` = nursing_home, assisted_living, group_home or shelter | `RES4`, tagged | all |
+| 3 | Contains an Overture group-quarters place (`OBM_GROUP_QUARTERS_PLACES`: prisons, juvenile detention, retirement homes, assisted living, skilled nursing, homeless shelters, halfway houses, convents/monasteries) | `RES4`, tagged | all |
+| 4 | OSM building name matches `OBM_GROUP_QUARTERS_NAME_PATTERN` (multilingual prison, barracks, residence-hall and care-home terms) and not `OBM_GROUP_QUARTERS_NAME_EXCLUDE` (museums, restaurants, day centres and similar) | `RES4`, tagged | OSM |
+| 5 | Nearest footprint within `OBM_GROUP_QUARTERS_POI_RADIUS_M` (25 m) of such a place, unless the next nearest is less than 1.5× as far | `RES4`, tagged | all |
+| 6 | Own class is residential (per OBM's tag table), but OBM's label is one of its overriding occupancies, other than the whole-site codes `ASS2`, `COM8`, `COM9`, `COM10`, `EDU4` and temporary lodging `RES3` | mixed: residential + the override's parent, floor split; both shares tagged | OSM |
+| 7 | `MIX1`, `MIX4` (mostly residential) | floor split | all |
+| 8 | `MIX2`, `MIX5` | OBM's 75/25 | all |
+
+- **Exceptions.** Rules 2–5 skip a footprint whose own class is explicit and incompatible with group quarters, such as a chapel or a garage. The compatible classes are residential, absent, or one of `OBM_GROUP_QUARTERS_COMPATIBLE_CLASSES`.
+- **Floor split.** The non-residential use takes the ground floor, so the residential share is 1 − 1/floors.
+  - **Single storey:** 50/50.
+  - **Unknown floors:** 75/25.
+  - **Floors:** Overture `num_floors`, else Overture height ÷ 3 m. Only OSM footprints have them.
+- **Label source per share.** A mixed share backed by the footprint's own tag or a POI is tagged. A `MIX` code's dominant share is inherited when the footprint sits in a zone of that use and its own tag doesn't name it.
+
+**How.**
+- **Sources:**
+  - Overture 2025-04-23.0 buildings (class, floors, height, names) and places;
+  - the OSM planet file (2025-04-18), scanned once with `osmium` (pyosmium) for site polygons.
+- **No full re-read.** The tiles' footprints are never re-read in full. The rules use the Step A tables, and read footprints only near site polygons and places.
+- **Output:** sparse, one row per footprint a rule touched: `fid`, `rule`, `occupancy`, `floors`, `floors_source`, and for each of up to two shares `parent`, `weight` and `source`.
+- **Step B:** `--effective-occupancy` applies the corrections on top of the label-source split. Whole corrections replace the parent. Fractional ones are rasterized by weight into `{parent}_{source}`. Every block is checked against the split run in `_open_building_map_SPLIT/`.
+
+**Output.**
+- **Per tile:** `…/02-processed-data/covariates/open_building_map_effective_occupancy/building.<quadkey>.parquet`, with per-tile rule counts in `summary.parquet`.
+- **Lookups:** in the raw OBM directory, `overture_building_attributes/`, `overture_group_quarters_places/` and `overture_osm_group_quarters_sites/`.
+- **Rasters:** the current paths, `…/open_building_map/2025-04-04/40m/`.
+
+```sh
+# Needs Step A. About 1–1.5 h, then about 3 h.
+pcrun extract open_building_map_effective_occupancy && \
+pcrun process open_building_map --obm-resolution 40 --effective-occupancy
+```
+
+**Results of the 2026-10-02 run** (2,902 blocks at 40m, all checks passed):
+- **Total density is conserved:** +0.006% globally, and at most 0.54% in any block.
+- **By parent:** `residential_mu` +0.55%, government −4.4%, assembly −4.1%, education −2.0%, `unknown` −0.2%.
+- **Label source:** `industrial_tagged` −15.5% and `industrial_inherited` +8.9%. The inherited share of labelled density goes from 71.40% to 72.64%.
+- **Rule counts:**
+
+  | Rule | Footprints |
+  |---|---|
+  | Group-quarters site polygons | 704,597 |
+  | Group-quarters class | 69,797 |
+  | Group-quarters place inside | 64,565 |
+  | Group-quarters place nearby | 52,291 |
+  | Group-quarters name | 5,113 |
+  | Residential-tag overrides made mixed | 283,268 |
+  | `MIX` footprints re-expressed | 6,631,358 |
+
+### Open Building Map — covariate runs and directories
+
+| Run | What | Directory under `…/02-processed-data/covariates/` |
+|---|---|---|
+| 1 | Unsplit, 8 parent layers | `_open_building_map_UNSPLIT/2025-04-04/` |
+| 2 | Label-source split, with the overlap fix | `_open_building_map_SPLIT/2025-04-04/` |
+| 3 | Split with the effective-occupancy rules | `open_building_map/2025-04-04/`, the path the population model reads |
+
+- **Renaming.** Each new run writes to `open_building_map/`, and the previous run is renamed aside first, so the model's paths never change.
+- **Reference constants:** `OBM_REFERENCE_DIRNAME` and `OBM_SPLIT_REFERENCE_DIRNAME`.
+- **The population model** builds run 3 as its `obm_20250404lr*` versions ("lr" = label rules).
+- **Handoffs:** `/mnt/share/homes/mfiking/claude/rra_pop_model/HANDOFF_OBM_NEW_LABEL_RULES.md` and, for Step A and Step B, `HANDOFF_OBM_SPLIT_RASTERS.md` in the same directory.
+
+### Open Building Map — known limitations and open questions
+
+**Decided and left as is:**
+- **Missing land-use classes.** Overture 2025-04-23.0 has no `mine`, `leisure`, `farm`, `greenhouse` or `government` land use, so footprints in those OSM zones come out tagged. That understates `inherited` slightly.
+- **Inherited is an upper bound on zone-derived labels.** OBM doesn't record which source it used, so a label from a point of interest or a `shop`/`amenity` tag inside a same-parent zone counts as inherited.
+- **Snapshot gaps.** Overture is 19 days newer than OBM, and the OSM planet file 14 days newer.
+- **Place precision.** Overture places come partly from non-OSM sources, so their positions are approximate.
+- **Unassigned places.** 16.6% of group-quarters places are left unassigned: they're ambiguous or more than 25 m from any footprint. A place labels one building; whole compounds are covered only by OSM site polygons.
+- **Name false positives.** Name matching can still match non-housing names. "Prison Street Apartments" is the common kind, and it's harmless.
+
+**To investigate:**
+- **`military` building class** (5.5k buildings, 78% `GOV`). It covers whole bases, not only housing, so it's unchanged.
+- **Accessory buildings labelled residential.** `garage`/`garages` are `RES` in OBM's own tag table (7.9M buildings). `shed`, `outbuilding` and `carport` inherit `RES` from residential zones (99%). This overstates residential volume slightly.
+- **Unknown-heavy dwelling classes.** `static_caravan`, `ger`, `houseboat` and `stilt_house` are 45–81% `UNK` and left to the GHSL credit. Whether GHSL credits them adequately is unchecked.
+- **Temporary lodging (`RES3`).** Unchanged, including 386k residential-tagged buildings carrying it. `cabin` (74% Norway) and `bungalow` (mostly holiday cottages in Poland, Finland, Germany and Denmark) are correctly `RES3`. British bungalows, which are real homes, aren't corrected.
+- **Floor coverage.** Floors are known for a minority of OSM buildings. The single-storey 50/50 split, and the assumption that the non-residential use takes one floor, are untested.
+- **Non-residential-tagged `MIX1`/`MIX4`.** About 1.2M `retail`, `office`, `industrial` and similar buildings that OBM labels mostly residential follow the mixed-use description and are floor-split. The building's own tag suggests they're mostly non-residential.
+- **Per-country inherited shares.** Not yet compared with the earlier sample analysis (`label_source_validation_targets.csv`).
 
 ## Development
 

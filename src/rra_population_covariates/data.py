@@ -27,6 +27,11 @@ class RawCovariateData:
         return list(Path(root).glob("*.parquet"))
 
     @property
+    def osm_planet(self) -> Path:
+        # Dated 2025-04-18, 14 days after the OBM snapshot.
+        return self._root / "osm" / "planet-latest.osm.pbf"
+
+    @property
     def logs(self) -> Path:
         return self._root / "logs"
 
@@ -71,6 +76,35 @@ class RawCovariateData:
 
     def list_open_building_map_paths(self) -> list[Path]:
         return sorted(self.open_building_map.glob("building.*.gpkg"))
+
+    # Overture lookups for the label-source classification. Each is partitioned by
+    # OBM quadkey (quadkey=<qk>/part-<source>.parquet) with one part per Overture
+    # source file, plus a marker per source file written once all its parts are.
+    def obm_overture_lookup(self, lookup: str) -> Path:
+        return self.open_building_map / f"overture_{lookup}"
+
+    def obm_overture_lookup_part_path(
+        self, lookup: str, quadkey: str, source_stem: str
+    ) -> Path:
+        return (
+            self.obm_overture_lookup(lookup)
+            / f"quadkey={quadkey}"
+            / f"part-{source_stem}.parquet"
+        )
+
+    def list_obm_overture_lookup_parts(self, lookup: str, quadkey: str) -> list[Path]:
+        root = self.obm_overture_lookup(lookup) / f"quadkey={quadkey}"
+        return sorted(root.glob("part-*.parquet"))
+
+    def obm_overture_lookup_marker_path(self, lookup: str, source_stem: str) -> Path:
+        return self.obm_overture_lookup(lookup) / "_sources" / f"{source_stem}.parquet"
+
+    def list_obm_overture_lookup_markers(self, lookup: str) -> list[Path]:
+        return sorted((self.obm_overture_lookup(lookup) / "_sources").glob("*.parquet"))
+
+    @property
+    def obm_land_use_classes_path(self) -> Path:
+        return self.open_building_map / "overture_land_use_classes.csv"
 
 
 class CovariateData:
@@ -128,6 +162,72 @@ class CovariateData:
         )
         mkdir(path.parent, exist_ok=True, parents=True)
         save_raster(raster, path)
+
+    @property
+    def open_building_map_reference(self) -> Path:
+        return self._root / pcc.OBM_REFERENCE_DIRNAME / pcc.OBM_VERSION
+
+    def open_building_map_reference_raster_path(
+        self,
+        resolution: str,
+        block_key: str,
+        parent_building_type: str,
+        measure: str,
+    ) -> Path:
+        return (
+            self.open_building_map_reference
+            / f"{resolution}m"
+            / block_key
+            / f"{parent_building_type}_{measure}.tif"
+        )
+
+    def open_building_map_split_reference_raster_path(
+        self,
+        resolution: str,
+        block_key: str,
+        layer: str,
+        measure: str,
+    ) -> Path:
+        return (
+            self._root
+            / pcc.OBM_SPLIT_REFERENCE_DIRNAME
+            / pcc.OBM_VERSION
+            / f"{resolution}m"
+            / block_key
+            / f"{layer}_{measure}.tif"
+        )
+
+    def open_building_map_check_path(self, resolution: str, block_key: str) -> Path:
+        # Kept out of the resolution directory, which holds only block directories.
+        return (
+            self.open_building_map
+            / "label_source_checks"
+            / f"{resolution}m"
+            / f"{block_key}.parquet"
+        )
+
+    @property
+    def open_building_map_classified(self) -> Path:
+        return self._root / "open_building_map_classified"
+
+    def open_building_map_classified_path(self, quadkey: str) -> Path:
+        # Named after the raw tile it classifies, building.<quadkey>.gpkg.
+        return self.open_building_map_classified / f"building.{quadkey}.parquet"
+
+    def open_building_map_classified_summary_path(self, quadkey: str) -> Path:
+        return (
+            self.open_building_map_classified
+            / "summary"
+            / f"building.{quadkey}.parquet"
+        )
+
+    @property
+    def open_building_map_effective(self) -> Path:
+        return self._root / "open_building_map_effective_occupancy"
+
+    def open_building_map_effective_path(self, quadkey: str) -> Path:
+        # Sparse: only the footprints whose occupancy a rule changed.
+        return self.open_building_map_effective / f"building.{quadkey}.parquet"
 
     @property
     def overture(self) -> Path:
